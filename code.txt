@@ -2,6 +2,38 @@ function rocket_simulation()
     % Initialize parameters
     params = initialize_rocket_parameters();
     
+    T = readtable('thrust_curve.csv', ...
+        'VariableNamingRule','preserve', ...
+        'TreatAsEmpty',{'NA','','–'});  % treat blanks or dashes as empty
+
+% Identify which columns are numeric
+% Assume the first two numeric columns are time and thrust
+varTypes = varfun(@class, T, 'OutputFormat','cell');
+isNumCol = strcmp(varTypes,'double') | strcmp(varTypes,'single');
+
+numCols = find(isNumCol);
+if numel(numCols) < 2
+    error('Thrust CSV must contain at least two numeric columns (time, thrust).');
+end
+
+timeCol   = numCols(1);
+thrustCol = numCols(2);
+
+% Extract data and remove any rows with NaN/Inf
+rawTime   = T{:, timeCol};
+rawThrust = T{:, thrustCol};
+maskValid = isfinite(rawTime) & isfinite(rawThrust);
+
+thrust_time = rawTime(maskValid);
+thrust_vals = rawThrust(maskValid);
+
+% Sort by time (interp1 requires monotonic X)
+[thrust_time, sortIdx] = sort(thrust_time);
+thrust_vals = thrust_vals(sortIdx);
+
+% Store in params
+params.thrust_time = thrust_time;
+params.thrust_vals = thrust_vals;
     % User-configurable launch angle (degrees)
     params.launch_angle = 90;  
     
@@ -20,8 +52,43 @@ function rocket_simulation()
     [t, y, te, ye, ie] = ode45(@(t,y) rocket_dynamics(t,y,params), ...
                                tspan, initial_conditions, options);
     
+        % ------------ New Code to Sample and Save State Data ------------
+
+    % Desired sampling rate (Hz) and interval
+    fs = 10;            % samples per second
+    dt = 1/fs;          % seconds between samples
+    t_sample = 0:dt:t(end);
+
+    % Interpolate each state onto the uniform grid
+    x_sample   = interp1(t, y(:,1), t_sample);
+    vx_sample  = interp1(t, y(:,2), t_sample);
+    alt_sample = interp1(t, y(:,3), t_sample);
+    vy_sample  = interp1(t, y(:,4), t_sample);
+    
+    % Compute flight path angle (degrees) at each sample
+    angle_sample = atan2d(vy_sample, vx_sample);
+    
+    % Package into a MATLAB timeseries
+    ts_x   = timeseries(x_sample,   t_sample, 'Name','x');
+    ts_vx  = timeseries(vx_sample,  t_sample, 'Name','vx');
+    ts_alt = timeseries(alt_sample, t_sample, 'Name','altitude');
+    ts_vy  = timeseries(vy_sample,  t_sample, 'Name','vy');
+    ts_angle = timeseries(angle_sample,   t_sample, 'Name','flight_angle');
+
+    % Combine into a single timedataset or save to .mat for Simulink import
+    save('rocket_states.mat','ts_x','ts_vx','ts_alt','ts_vy','ts_angle');
+
+    % Or write to CSV for external import
+    T = table(t_sample(:), x_sample(:), vx_sample(:), alt_sample(:), vy_sample(:), angle_sample(:), ...
+          'VariableNames', {'time','x','vx','altitude','vy','flight_angle'});
+
+    writetable(T,'rocket_states.csv');
+
+    % ---------------- End of Sampling & Saving --------------------
+    
     % Real-time visualization
     visualize_flight(t, y, te, ye, ie, params);
+
 end
 
 function dydt = rocket_dynamics(t, y, params)
@@ -94,7 +161,7 @@ end
 function [thrust, mass, cd, ref_area] = calculate_forces(t, phase, params)
     switch phase
         case 1  % powered ascent
-            thrust = params.max_thrust;
+            thrust = interp1(params.thrust_time, params.thrust_vals, t, 'linear', 0);
             mass   = params.init_mass - params.mass_flow*t;
             cd     = params.cd_before_main;
             ref_area = params.ref_area_before_main;
